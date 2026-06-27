@@ -402,9 +402,9 @@ def main():
     # Parent parser for shared arguments
     parent = argparse.ArgumentParser(add_help=False)
     parent.add_argument("-d",     metavar="DOMAIN",   required=True,
-                        help="Domain FQDN e.g. mandrill.local")
+                        help="Domain FQDN e.g. contoso.local")
     parent.add_argument("-dc-ip", metavar="DC",       default="",
-                        help="DC FQDN or IP (e.g. DC01.lab or 10.0.0.1)")
+                        help="DC FQDN or IP (e.g. DC01.contoso.local or 10.0.0.1)")
     parent.add_argument("-u",     metavar="USERNAME", default="", 
                         help="Domain user (or machine account for decrypt)")
     parent.add_argument("-p",     metavar="PASSWORD", default="", 
@@ -431,7 +431,7 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
         """
     )
     p_dec.add_argument("-share",  metavar="UNC",      default="",
-                       help=r"Share UNC e.g. \DC01.lab\ArcShare (auto-discovered if omitted)")
+                       help=r"Share UNC e.g. \DC01.constoso.local\ArcShare (auto-discovered if omitted)")
 
     # auth modes (-auto is mutually exclusive with standalone -u)
     auth_grp = p_dec.add_mutually_exclusive_group(required=False)
