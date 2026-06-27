@@ -980,6 +980,8 @@ def cmd_decrypt(args):
             pline("DEC", _good, f"Blob saved to {dump_path}")
 
         # DPAPI-NG decrypt
+        pline("DEC", _info, "Trying to decrypt with DPAPI-NG...")
+        pline("DEC", _info, "Fetching GKDI key from Domain Controller...")
         dbg("DEC", _info, f"GKDI GetKey → {dc} ...")
         try:
             plaintext, _ridx = _unprotect_dpapi_ng(
@@ -992,7 +994,7 @@ def cmd_decrypt(args):
             dbg("DEC", _info, f"Unwrapped via recipient[{_ridx}]")
             secret = plaintext.decode("utf-8", errors="ignore").rstrip("\x00")
         except Exception as e:
-            print(_bad(f"Decryption failed: {e}"))
+            print(_bad(f"Decryption failed: :( {e}"))
             err = str(e).lower()
             if "all recipients failed" in err and ("access" in err or "denied" in err or "permitted" in err):
                 print(_warn("GKDI GetKey was reached but refused every recipient."))
@@ -1010,7 +1012,7 @@ def cmd_decrypt(args):
             sys.exit(1)
 
         section("Result")
-        print(f"  {_good('Decryption successful')}")
+        print(f"  {_good('Decryption successful!')}")
         print()
 
         # Parse ArcInfo.json for SP ID and Tenant ID
