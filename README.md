@@ -2,7 +2,7 @@
 
 Arc Decrypt is a tool for enumerating Azure Arc deployments and decrypting the `encryptedServicePrincipalSecret` used during Azure Arc onboarding.
 
-When Azure Arc is deployed via Group Policy Object (GPO), the service principal secret is encrypted, stored on a DC file share, and made accessible to machine accounts. This tool automatically locates the deployment share and uses DPAPI-NG (NCryptProtectSecret) to unwrap the secret.
+When Azure Arc is deployed via Group Policy Object (GPO), the service principal secret is encrypted, stored on a file share, and made accessible to machine accounts. This tool attempts to automatically locate the deployment share and uses DPAPI-NG (NCryptProtectSecret) to unwrap the secret.
 - https://learn.microsoft.com/en-us/azure/azure-arc/servers/onboard-group-policy-powershell
 
 ## Features
