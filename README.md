@@ -17,6 +17,13 @@ When Azure Arc is deployed via Group Policy Object (GPO), the service principal 
 
 The tool operates using two primary subcommands: `find` and `decrypt`.
 
+**Install**
+
+```bash
+sudo apt install libkrb5-dev gcc python3-dev
+pip3 install -r requirements.txt
+```
+
 ### 1. Find Mode
 
 Detects Arc GPOs and identifies the deployment share where secrets and onboarding scripts (`AzureArcDeployment.psm1`, `ArcInfo.json`) reside.
