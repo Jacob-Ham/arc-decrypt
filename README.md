@@ -12,6 +12,7 @@ When Azure Arc is deployed via Group Policy Object (GPO), the service principal 
 - **Automated Decryption**: Handles DPAPI-NG decryption for the `encryptedServicePrincipalSecret`.
 - **Machine Account Auto-Creation**: Dynamically provisions a temporary machine account (which is typically granted decryption rights via DPAPI-NG) using standard domain user credentials.
 - **Kerberos Authentication**: Full Kerberos support via ccache (SMB, LDAP, SAMR, and DPAPI-NG).
+- **LDAPS**: Optional LDAP over TLS (port 636) via `-ldaps`, covering both GPO discovery and share auto-discovery.
 
 
 ## Authentication
@@ -23,6 +24,8 @@ The tool supports three authentication methods (mutually exclusive):
 | Password | `-u USER -p PASS` | NTLM |
 | NTLM hash | `-u USER -H LM:NT` | Overpass-the-hash; `LM:NT` or bare `NT` hex |
 | Kerberos | `-u USER -k` or `-u USER -ccache /path/to/ccache` | Requires `gssapi` + `krb5` packages (see below) |
+
+> **LDAPS:** Add `-ldaps` to any command to wrap the LDAP session in TLS (port 636). Certificate verification is off by default, so it works against DCs with self-signed or AD-CS certificates. Applies to every LDAP query in both `find` and `decrypt`; SMB, SAMR, and DPAPI-NG RPC paths are unaffected.
 
 **Kerberos setup:**
 ```bash
@@ -70,6 +73,7 @@ By default both discovery methods are used: GPO/SYSVOL parsing first, then SMB k
 - `-p PASSWORD`: Domain user password (mutually exclusive with `-H` and `-k`)
 - `-H LM:NT`: NTLM hash for authentication, as `LM:NT` or a bare `NT` hex string (mutually exclusive with `-p` and `-k`)
 - `-k`, `-kerberos`: Use Kerberos authentication (requires valid ccache; see [Authentication](#authentication))
+- `-ldaps`: Use LDAPS (LDAP over TLS, port 636, cert verify off)
 - `-ccache PATH`: Path to Kerberos ccache file (implies `-k`)
 - `-v`, `-verbose`: Show every discovery step in detail
 - `-debug-sysvol`: (Optional) Walk and print the full GPO SYSVOL directory tree
@@ -91,6 +95,11 @@ python3 arc-decrypt.py find -d contoso.local -dc-ip 10.0.0.5 -u "jsmith" -H "aad
 *Kerberos authentication:*
 ```bash
 python3 arc-decrypt.py find -d contoso.local -dc-ip 10.0.0.5 -u "jsmith" -k
+```
+
+*LDAPS (LDAP over TLS, port 636):*
+```bash
+python3 arc-decrypt.py find -d contoso.local -dc-ip 10.0.0.5 -u "jsmith" -p "Password123!" -ldaps
 ```
 
 ### 2. Decrypt Mode

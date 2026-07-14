@@ -9,12 +9,13 @@ import os
 import random
 import re
 import socket
+import ssl
 import string
 import sys
 import traceback
 
 try:
-    from ldap3 import Server, Connection, ALL, NTLM, SASL, SUBTREE
+    from ldap3 import Server, Connection, ALL, NTLM, SASL, SUBTREE, Tls
     HAS_LDAP3 = True
 except ImportError:
     HAS_LDAP3 = False
@@ -90,7 +91,7 @@ def _warn(msg): return f"{YELLOW}[!]{RESET} {msg}"
 def _bad(msg):  return f"{RED}[-]{RESET} {msg}"
 def _info(msg): return f"{CYAN}[*]{RESET} {msg}"
 
-CONFIG = {"verbose": False, "kerberos": False, "ccache": "", "dc_host": ""}
+CONFIG = {"verbose": False, "kerberos": False, "ccache": "", "dc_host": "", "ldaps": False}
 
 def pline(prefix, status_fn, msg):
     print(f"  {BOLD}{prefix}:{RESET} {status_fn(msg)}")
@@ -178,8 +179,16 @@ def _ldap_connect(dc, domain, username, password, prefix="LDAP"):
 
     Returns a Connection or None on bind failure (caller handles return).
     """
-    srv = Server(dc, get_info=ALL, connect_timeout=5)
+    srv = Server(
+        dc,
+        get_info=ALL,
+        connect_timeout=5,
+        use_ssl=CONFIG["ldaps"],
+        tls=Tls(validate=ssl.CERT_NONE) if CONFIG["ldaps"] else None,
+    )
     try:
+        if CONFIG["ldaps"]:
+            dbg(prefix, _info, f"Binding via LDAPS (TLS, port 636, cert verify off)")
         if CONFIG["kerberos"]:
             dbg(prefix, _info, f"Binding with GSSAPI (Kerberos ccache)")
             # For Kerberos, GSSAPI derives the SPN from the server hostname.
@@ -565,6 +574,8 @@ def main():
                            help="NTLM hash (LM:NT or bare NT hex)")
     parent.add_argument("-k", "-kerberos", dest="kerberos", action="store_true",
                         help="Use Kerberos authentication (requires valid ccache)")
+    parent.add_argument("-ldaps", dest="ldaps", action="store_true",
+                        help="Use LDAPS (LDAP over TLS, port 636, cert verify off)")
     parent.add_argument("-ccache", metavar="PATH", default="",
                         help="Path to Kerberos ccache file (implies -k)")
     parent.add_argument("-v", "-verbose", dest="verbose", action="store_true",
@@ -612,6 +623,7 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
     args = parser.parse_args()
 
     CONFIG["verbose"] = getattr(args, "verbose", False)
+    CONFIG["ldaps"] = getattr(args, "ldaps", False)
     if getattr(args, "ccache", ""):
         CONFIG["ccache"] = args.ccache
         CONFIG["kerberos"] = True
@@ -650,6 +662,8 @@ If -share is omitted, the Arc share is auto-discovered via GPO/SYSVOL.
 
     print(f"  {_info(f'Domain : {domain}')}")
     print(f"  {_info(f'DC     : {dc}')}")
+    if CONFIG["ldaps"]:
+        print(f"  {_info('LDAP   : LDAPS (TLS, port 636)')}")
     if CONFIG["kerberos"]:
         print(f"  {_info(f'User   : {username or '(ccache)'}  [Kerberos]')}")
     elif username:
@@ -1107,6 +1121,8 @@ def cmd_decrypt(args):
     banner()
     print(f"  {_info(f'Domain : {domain}')}")
     print(f"  {_info(f'DC     : {dc}')}")
+    if CONFIG["ldaps"]:
+        print(f"  {_info('LDAP   : LDAPS (TLS, port 636)')}")
     if share_unc:
         print(f"  {_info(f'Share  : {share_unc}')}")
     else:
